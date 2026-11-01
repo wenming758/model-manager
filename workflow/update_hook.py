@@ -91,8 +91,145 @@ def _insert_title_icon(window):
         pass
 
 
+class _GdipStartup(ctypes.Structure):
+    _fields_ = [("GdiplusVersion", ctypes.c_uint),
+                ("DebugEventCallback", ctypes.c_void_p),
+                ("SuppressBackgroundThread", ctypes.c_int),
+                ("SuppressExternalCodecs", ctypes.c_int)]
+
+
+class _GdipGuid(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+
+_gdip = [None]
+
+
+def _gdiplus():
+    """加载 GDI+，用于把壁纸按窗口尺寸高质量缩放。"""
+    if _gdip[0] is not None:
+        return _gdip[0]
+    try:
+        lib = ctypes.WinDLL("gdiplus")
+        lib.GdiplusStartup.argtypes = [ctypes.POINTER(ctypes.c_size_t),
+                                       ctypes.POINTER(_GdipStartup), ctypes.c_void_p]
+        lib.GdiplusStartup.restype = ctypes.c_int
+        token = ctypes.c_size_t()
+        start = _GdipStartup()
+        start.GdiplusVersion = 1
+        if lib.GdiplusStartup(ctypes.byref(token), ctypes.byref(start), None) != 0:
+            return None
+        for name, args in (
+                ("GdipCreateBitmapFromFile", [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)]),
+                ("GdipCreateBitmapFromScan0", [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_int, ctypes.c_void_p,
+                                               ctypes.POINTER(ctypes.c_void_p)]),
+                ("GdipGetImageGraphicsContext", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]),
+                ("GdipSetInterpolationMode", [ctypes.c_void_p, ctypes.c_int]),
+                ("GdipSetPixelOffsetMode", [ctypes.c_void_p, ctypes.c_int]),
+                ("GdipSetClipRectI", [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+                ("GdipGraphicsClear", [ctypes.c_void_p, ctypes.c_uint]),
+                ("GdipDrawImageRectI", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int]),
+                ("GdipSaveImageToFile", [ctypes.c_void_p, ctypes.c_wchar_p,
+                                         ctypes.POINTER(_GdipGuid), ctypes.c_void_p]),
+                ("GdipGetImageWidth", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]),
+                ("GdipGetImageHeight", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]),
+                ("GdipDisposeImage", [ctypes.c_void_p]),
+                ("GdipDeleteGraphics", [ctypes.c_void_p])):
+            fn = getattr(lib, name)
+            fn.argtypes = args
+            fn.restype = ctypes.c_int
+        clsid = _GdipGuid()
+        raw = __import__("uuid").UUID("{557cf406-1a04-11d3-9a73-0000f81ef32e}").bytes_le
+        clsid.Data1 = int.from_bytes(raw[0:4], "little")
+        clsid.Data2 = int.from_bytes(raw[4:6], "little")
+        clsid.Data3 = int.from_bytes(raw[6:8], "little")
+        for i in range(8):
+            clsid.Data4[i] = raw[8 + i]
+        _gdip[0] = (lib, token, clsid)
+        return _gdip[0]
+    except Exception:
+        return None
+
+
+def _scale_png(src, dst, width, height):
+    """等比铺满（cover）并居中裁切。"""
+    g = _gdiplus()
+    if g is None:
+        return False
+    lib, _token, clsid = g
+    try:
+        width = max(64, min(int(width), 3840))
+        height = max(64, min(int(height), 2160))
+        bmp = ctypes.c_void_p()
+        if lib.GdipCreateBitmapFromFile(src, ctypes.byref(bmp)) != 0:
+            return False
+        try:
+            iw, ih = ctypes.c_int(), ctypes.c_int()
+            lib.GdipGetImageWidth(bmp, ctypes.byref(iw))
+            lib.GdipGetImageHeight(bmp, ctypes.byref(ih))
+            if iw.value <= 0 or ih.value <= 0:
+                return False
+            out = ctypes.c_void_p()
+            if lib.GdipCreateBitmapFromScan0(width, height, 0, 0x26200A,
+                                             None, ctypes.byref(out)) != 0:
+                return False
+            try:
+                gr = ctypes.c_void_p()
+                lib.GdipGetImageGraphicsContext(out, ctypes.byref(gr))
+                try:
+                    lib.GdipSetInterpolationMode(gr, 7)
+                    lib.GdipSetPixelOffsetMode(gr, 2)
+                    lib.GdipGraphicsClear(gr, 0xFFCFE2F2)
+                    lib.GdipSetClipRectI(gr, 0, 0, width, height, 1)
+                    ratio = max(1.0 * width / iw.value, 1.0 * height / ih.value)
+                    dw = max(1, int(iw.value * ratio + 0.5))
+                    dh = max(1, int(ih.value * ratio + 0.5))
+                    lib.GdipDrawImageRectI(gr, bmp, (width - dw) // 2, (height - dh) // 2, dw, dh)
+                finally:
+                    lib.GdipDeleteGraphics(gr)
+                if lib.GdipSaveImageToFile(out, dst, ctypes.byref(clsid), None) != 0:
+                    return False
+            finally:
+                lib.GdipDisposeImage(out)
+        finally:
+            lib.GdipDisposeImage(bmp)
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
+def _background_photo(window, width, height):
+    import tkinter
+    key = (int(width), int(height))
+    if getattr(window, "_mm_bg_photo_key", None) == key:
+        return window._mm_bg_photo
+    cache = os.path.join(tempfile.gettempdir(), "mm_bg")
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except Exception:
+        return None
+    src = os.path.join(cache, "background_src.png")
+    if not os.path.exists(src):
+        with open(src, "wb") as f:
+            f.write(base64.b64decode(_BG_PNG_B64))
+    dst = os.path.join(cache, "background_%dx%d.png" % key)
+    if not _scale_png(src, dst, key[0], key[1]):
+        return None
+    try:
+        photo = tkinter.PhotoImage(master=window, file=dst)
+    except Exception:
+        return None
+    window._mm_bg_photo = photo
+    window._mm_bg_photo_key = key
+    return photo
+
+
 def _install_background(window):
-    """把卡通壁纸铺在最大画布的最底层，并跟随滚动固定在视口顶部。"""
+    """把卡通壁纸铺在最大画布的最底层，跟随窗口尺寸缩放并固定在视口顶部。"""
     try:
         import tkinter
         if getattr(window, "_mm_bg_item", None) is not None:
@@ -116,10 +253,37 @@ def _install_background(window):
                 window._mm_bg_tries = tries + 1
                 window.after(250, lambda: _install_background(window))
             return
-        photo = _photo(window, _BG_PNG_B64, "_mm_bg_photo")
-        item = canvas.create_image(0, 0, anchor="nw", image=photo)
+        photo = _background_photo(window, canvas.winfo_width(), canvas.winfo_height())
+        item = canvas.create_image(0, 0, anchor="nw", image=photo or _photo(window, _BG_PNG_B64, "_mm_bg_photo"))
         canvas.tag_lower(item)
         window._mm_bg_item = item
+        window._mm_bg_size = (canvas.winfo_width(), canvas.winfo_height())
+
+        def fit():
+            try:
+                if not canvas.winfo_exists():
+                    return
+                w, h = canvas.winfo_width(), canvas.winfo_height()
+                old = getattr(window, "_mm_bg_size", (0, 0))
+                if abs(w - old[0]) >= 16 or abs(h - old[1]) >= 16:
+                    scaled = _background_photo(window, w, h)
+                    if scaled is not None:
+                        canvas.itemconfigure(item, image=scaled)
+                        window._mm_bg_size = (w, h)
+                canvas.coords(item, 0, int(canvas.canvasy(0)))
+                canvas.tag_lower(item)
+            except Exception:
+                pass
+
+        def resized(_event=None):
+            try:
+                if getattr(window, "_mm_bg_job", None):
+                    window.after_cancel(window._mm_bg_job)
+            except Exception:
+                pass
+            window._mm_bg_job = window.after(220, fit)
+
+        canvas.bind("<Configure>", resized, add="+")
 
         def keep():
             try:
@@ -131,6 +295,134 @@ def _install_background(window):
                 pass
 
         keep()
+    except Exception:
+        pass
+
+
+def _install_card_flow(window):
+    """窗口变宽时按可用宽度重排卡片列数，并让内容区填满画布。"""
+    try:
+        import tkinter
+        if getattr(window, "_mm_flow_on", False):
+            return
+        window._mm_flow_on = True
+        state = {}
+
+        def locate():
+            best = [None, 0]
+
+            def walk(widget):
+                for child in widget.winfo_children():
+                    if child.winfo_class() == "Canvas":
+                        area = child.winfo_width() * child.winfo_height()
+                        if child.winfo_width() > 500 and child.winfo_height() > 200 and area > best[1]:
+                            best[0] = child
+                            best[1] = area
+                    walk(child)
+
+            walk(window)
+            canvas = best[0]
+            if canvas is None:
+                return False
+            inner = item = None
+            for i in canvas.find_all():
+                if canvas.type(i) != "window":
+                    continue
+                try:
+                    widget = window.nametowidget(canvas.itemcget(i, "window"))
+                except Exception:
+                    continue
+                inner, item = widget, i
+                break
+            if inner is None:
+                return False
+            found = [None, 0]
+
+            def walk2(widget):
+                kids = [k for k in widget.winfo_children() if k.grid_info()]
+                if len(kids) > found[1]:
+                    found[0] = widget
+                    found[1] = len(kids)
+                for k in widget.winfo_children():
+                    walk2(k)
+
+            walk2(inner)
+            if found[0] is None:
+                return False
+            state.update(canvas=canvas, inner=inner, item=item, container=found[0])
+            return True
+
+        def cards_of(container):
+            return [k for k in container.winfo_children() if k.grid_info()]
+
+        def columns_of(cards):
+            return max(int(k.grid_info()["column"]) for k in cards) + 1
+
+        def ordered(cards):
+            return sorted(cards, key=lambda k: (int(k.grid_info()["row"]),
+                                                int(k.grid_info()["column"])))
+
+        def apply():
+            if not locate():
+                return
+            canvas, inner, item, container = (state["canvas"], state["inner"],
+                                              state["item"], state["container"])
+            width = canvas.winfo_width()
+            if width < 400:
+                return
+            cards = cards_of(container)
+            if len(cards) < 2:
+                return
+            # 原始 4 列布局下卡片宽 232、间距 16，重排时按此基准算列数
+            cell = state.setdefault("cell", 248)
+            cols = min(max(4, (width - 4) // max(cell, 1)), len(cards))
+            if cols <= 4:
+                if state.get("expanded"):
+                    canvas.itemconfigure(item, width=0)
+                    for j in range(16):
+                        container.grid_columnconfigure(j, weight=1 if j < 4 else 0)
+                    for i, k in enumerate(ordered(cards)):
+                        k.grid_configure(row=i // 4, column=i % 4)
+                    inner.update_idletasks()
+                    canvas.configure(scrollregion=(0, 0, max(inner.winfo_reqwidth(), 1),
+                                                   max(inner.winfo_reqheight(), 1)))
+                    state["expanded"] = False
+                return
+            if state.get("expanded") and columns_of(cards) == cols:
+                return
+            canvas.itemconfigure(item, width=width)
+            for j in range(16):
+                container.grid_columnconfigure(j, weight=1 if j < cols else 0)
+            for i, k in enumerate(ordered(cards)):
+                k.grid_configure(row=i // cols, column=i % cols)
+            inner.update_idletasks()
+            canvas.configure(scrollregion=(0, 0, width, max(inner.winfo_reqheight(), 1)))
+            state["expanded"] = True
+
+        def tick():
+            try:
+                if not window.winfo_exists():
+                    return
+                apply()
+                window.after(500, tick)
+            except Exception:
+                pass
+
+        def resized(_event=None):
+            try:
+                if getattr(window, "_mm_flow_job", None):
+                    window.after_cancel(window._mm_flow_job)
+            except Exception:
+                pass
+            window._mm_flow_job = window.after(160, apply)
+
+        window.after(700, tick)
+        try:
+            locate()
+            if state.get("canvas"):
+                state["canvas"].bind("<Configure>", resized, add="+")
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -318,8 +610,15 @@ def _apply_patch(local_exe, manifest, patch_path, dest):
     return True
 
 
-def _update_batch(stage, target, pid):
+def _update_batch(stage, target, pid, digest):
+    """先校验临时副本，再原子改名覆盖；避免半截文件被当成新版本启动。"""
     bat = os.path.join(tempfile.gettempdir(), "mm_update_%d.bat" % int(time.time()))
+    verify = ""
+    if digest:
+        verify = ('powershell -NoProfile -ExecutionPolicy Bypass -Command '
+                  '"if ((Get-FileHash -LiteralPath \'{0}.new\' -Algorithm SHA256).Hash '
+                  '-ne \'{1}\') {{ exit 1 }}" >nul 2>&1\r\n'
+                  'if errorlevel 1 goto retry\r\n').format(target, digest)
     body = f"""@echo off
 chcp 65001 >nul
 :wait
@@ -330,15 +629,25 @@ if not errorlevel 1 (
 )
 set n=0
 :copy
-copy /Y "{stage}" "{target}" >nul 2>&1
-if not errorlevel 1 goto run
+copy /Y "{stage}" "{target}.new" >nul 2>&1
+if errorlevel 1 goto retry
+{verify}move /Y "{target}.new" "{target}" >nul 2>&1
+if errorlevel 1 goto retry
+goto run
+:retry
 set /a n+=1
-if %n% geq 40 goto run
+if %n% geq 60 goto giveup
 timeout /t 1 /nobreak >nul
 goto copy
 :run
 start "" "{target}"
 del "{stage}" >nul 2>&1
+del "{target}.new" >nul 2>&1
+del "%~f0" >nul 2>&1
+exit /b
+:giveup
+del "{target}.new" >nul 2>&1
+start "" "{target}"
 del "%~f0" >nul 2>&1
 """
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
@@ -358,7 +667,7 @@ def _apply_update(window, new_exe):
         shutil.copyfile(new_exe, stage)
     except Exception:
         stage = new_exe
-    _update_batch(stage, target, os.getpid())
+    _update_batch(stage, target, os.getpid(), _sha256(new_exe))
     window.destroy()
     os._exit(0)
 
@@ -484,10 +793,14 @@ def _run_update(window, version, url, manifest_url, patch_url, info):
     threading.Thread(target=work, daemon=True).start()
 
 
-def _check_update(window):
+def _check_update(window, auto=False):
     import tkinter
     from tkinter import messagebox
 
+    if auto:
+        if getattr(window, "_mm_auto_checked", False):
+            return
+        window._mm_auto_checked = True
     if getattr(window, "_mm_update_busy", False):
         return
     window._mm_update_busy = True
@@ -512,7 +825,8 @@ def _check_update(window):
         except Exception as exc:
             def fail():
                 done()
-                messagebox.showerror("检测更新失败", "无法连接 Gitee 更新源。\n\n%s" % exc, parent=window)
+                if not auto:
+                    messagebox.showerror("检测更新失败", "无法连接 Gitee 更新源。\n\n%s" % exc, parent=window)
             window.after(0, fail)
             return
         newest = _version_tuple(tag)
@@ -520,13 +834,15 @@ def _check_update(window):
         if not tag or newest <= current:
             def up_to_date():
                 done()
-                messagebox.showinfo("检测更新", "当前已是最新版本 v%s。" % _APP_VERSION, parent=window)
+                if not auto:
+                    messagebox.showinfo("检测更新", "当前已是最新版本 v%s。" % _APP_VERSION, parent=window)
             window.after(0, up_to_date)
             return
         if not url:
             def no_asset():
                 done()
-                messagebox.showwarning("检测更新", "发现新版本 %s，但更新源缺少安装包。" % tag, parent=window)
+                if not auto:
+                    messagebox.showwarning("检测更新", "发现新版本 %s，但更新源缺少安装包。" % tag, parent=window)
             window.after(0, no_asset)
             return
         notes = (body or "").strip()
@@ -600,10 +916,12 @@ def _fix_taskbar_style(window):
             _insert_title_icon(window)
             _install_update_button(window)
             _install_background(window)
+            _install_card_flow(window)
             try:
                 window.deiconify()
             except Exception:
                 pass
+            window.after(2500, lambda: _check_update(window, True))
 
         window.after(60, _reshow)
     except Exception:
