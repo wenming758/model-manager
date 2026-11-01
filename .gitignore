@@ -15,5 +15,7 @@ _probe*.py
 
 # 本地测试包与发布附件
 模型管理_v*.exe
+模型管理_test*.exe
 model-manager-v*.exe
 model-manager-v*.json
+model-manager-v*.patch

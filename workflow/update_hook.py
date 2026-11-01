@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,7 +27,8 @@ _REPO_PAGE = "https://gitee.com/" + _REPO
 _API_LATEST = "https://gitee.com/api/v5/repos/" + _REPO + "/releases/latest"
 _UA = "ModelManager-Update/" + _APP_VERSION
 _NO_WINDOW = 0x08000000
-_CHUNK = 512 * 1024
+_MEI_MAGIC = b"MEI\014\013\012\013\016"
+_PATCH_MAGIC = b"MMP1"
 
 
 def _photo(window, data_b64, cache_name):
@@ -168,7 +170,7 @@ def _latest_release():
     data = _curl_json(_API_LATEST)
     tag = str(data.get("tag_name") or "")
     assets = data.get("assets") or []
-    exe = manifest = None
+    exe = manifest = patch = None
     for a in assets:
         name = str(a.get("name") or "")
         url = str(a.get("browser_download_url") or "")
@@ -178,7 +180,9 @@ def _latest_release():
             exe = url
         elif name.lower().endswith(".json"):
             manifest = url
-    return tag, str(data.get("name") or ""), str(data.get("body") or ""), exe, manifest
+        elif name.lower().endswith(".patch"):
+            patch = url
+    return tag, str(data.get("name") or ""), str(data.get("body") or ""), exe, manifest, patch
 
 
 def _version_tuple(text):
@@ -215,17 +219,6 @@ def _download_full(url, path):
         raise RuntimeError("下载失败")
 
 
-def _download_range(url, start, end):
-    exe = _curl()
-    if not exe:
-        return None
-    out = _run([exe, "-sSL", "--fail", "--max-time", "120", "-A", _UA,
-                "-r", "%d-%d" % (start, end), url], timeout=130)
-    if out.returncode != 0:
-        return None
-    return out.stdout
-
-
 def _sha256(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -234,39 +227,94 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def _delta_download(local_exe, manifest, url, dest, progress):
-    """按分块哈希只下载变化的部分；失败返回 False 交给全量下载。"""
-    size = int(manifest.get("size") or 0)
-    chunk = int(manifest.get("chunk") or 0)
-    hashes = manifest.get("chunks") or []
-    if size <= 0 or chunk <= 0 or not hashes or not os.path.exists(local_exe):
-        return False
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _archive(path):
+    """读取 PyInstaller onefile 的 CArchive，返回文件头、归档区和条目。"""
+    with open(path, "rb") as f:
+        data = f.read()
+    at = data.rfind(_MEI_MAGIC)
+    if at < 0:
+        return None
+    pkg_len, tocpos, toclen, pyver = struct.unpack("!IIII", data[at + 8:at + 24])
+    pylibname = data[at + 24:at + 88]
+    base = len(data) - pkg_len
+    if base <= 0 or base + tocpos + toclen > len(data):
+        return None
+    entries = []
+    j = base + tocpos
+    end = j + toclen
+    while j < end:
+        elen, off, dlen, ulen, cf, ty = struct.unpack("!IIIIBB", data[j:j + 18])
+        if elen < 18 or j + elen > end:
+            return None
+        name = data[j + 18:j + elen].split(b"\0")[0].decode("utf-8", "replace")
+        raw = data[base + off:base + off + dlen]
+        if len(raw) != dlen:
+            return None
+        entries.append({"name": name, "raw": raw, "ty": ty, "cf": cf, "ulen": ulen})
+        j += elen
+    return {"data": data, "base": base, "entries": entries,
+            "pyver": pyver, "pylibname": pylibname}
+
+
+def _toc_entry(name, ty, off, dlen, ulen, cf):
+    body = name.encode("utf-8") + b"\0"
+    elen = (18 + len(body) + 15) // 16 * 16
+    return (struct.pack("!IIIIBB", elen, off, dlen, ulen, cf, ty) + body
+            + b"\0" * (elen - 18 - len(body)))
+
+
+def _apply_patch(local_exe, manifest, patch_path, dest):
+    """用归档条目级补丁拼出新 exe；失败返回 False 交给全量下载。"""
     try:
-        with open(local_exe, "rb") as f:
-            data = f.read()
+        with open(patch_path, "rb") as f:
+            blob_all = f.read()
+        if blob_all[:4] != _PATCH_MAGIC:
+            return False
+        head_len, data_len = struct.unpack("!II", blob_all[4:12])
+        if len(blob_all) != 12 + head_len + data_len:
+            return False
+        header = json.loads(blob_all[12:12 + head_len].decode("utf-8"))
+        blob = blob_all[12 + head_len:]
     except Exception:
         return False
-    if len(data) != size or len(hashes) != (size + chunk - 1) // chunk:
+    if str(header.get("base_sha256") or "") != _sha256(local_exe):
         return False
-    need = [i for i, h in enumerate(hashes)
-            if hashlib.sha1(data[i * chunk:min(size, (i + 1) * chunk)]).hexdigest() != h]
-    if not need:
-        with open(dest, "wb") as f:
-            f.write(data)
-        return True
-    total = sum(min(size, (i + 1) * chunk) - i * chunk for i in need)
-    done = 0
-    buf = bytearray(data)
-    for i in need:
-        start, end = i * chunk, min(size, (i + 1) * chunk)
-        piece = _download_range(url, start, end - 1)
-        if piece is None or len(piece) != end - start:
+    old = _archive(local_exe)
+    if old is None:
+        return False
+    if _sha(old["data"][:old["base"]]) != str(header.get("prefix_sha256") or ""):
+        return False
+    local = {e["name"]: e["raw"] for e in old["entries"]}
+    body = bytearray()
+    toc = bytearray()
+    for e in header.get("entries") or []:
+        want = str(e.get("sha256") or "")
+        raw = local.get(str(e.get("name") or ""))
+        if raw is not None and _sha(raw) != want:
+            raw = None
+        if raw is None:
+            off, size = int(e.get("off", -1)), int(e.get("len", 0))
+            if off < 0 or size < 0 or off + size > len(blob):
+                return False
+            raw = blob[off:off + size]
+        if _sha(raw) != want:
             return False
-        buf[start:end] = piece
-        done += end - start
-        progress(done, total)
+        pos = len(body)
+        body += raw
+        toc += _toc_entry(str(e["name"]), int(e["ty"]), pos, len(raw),
+                          int(e["ulen"]), int(e["cf"]))
+    pkg_len = len(body) + len(toc) + 88
+    out = (old["data"][:old["base"]] + bytes(body) + bytes(toc)
+           + struct.pack("!8sIIII64s", _MEI_MAGIC, pkg_len, len(body), len(toc),
+                         int(header.get("pyver") or old["pyver"]), old["pylibname"]))
+    if _sha(out) != str(manifest.get("sha256") or header.get("sha256") or ""):
+        return False
     with open(dest, "wb") as f:
-        f.write(bytes(buf))
+        f.write(out)
     return True
 
 
@@ -324,7 +372,11 @@ def _center(top, parent):
     top.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
 
 
-def _run_update(window, version, url, manifest_url, info):
+def _current_exe():
+    return sys.executable if getattr(sys, "frozen", False) else None
+
+
+def _run_update(window, version, url, manifest_url, patch_url, info):
     import tkinter
     from tkinter import messagebox, ttk
 
@@ -375,20 +427,38 @@ def _run_update(window, version, url, manifest_url, info):
                 except Exception:
                     manifest = None
             ok = False
-            if manifest and isinstance(manifest, dict):
-                want = int(manifest.get("size") or 0)
-                ui(lambda: hint.config(text="正在比对本地文件…"))
-                ok = _delta_download(sys.executable, manifest, url, dest, progress)
+            want = ""
+            if isinstance(manifest, dict):
+                want = str(manifest.get("sha256") or "").lower()
+                pinfo = manifest.get("patch") or {}
+                local_exe = _current_exe()
+                if (local_exe and patch_url and isinstance(pinfo, dict)
+                        and pinfo.get("sha256")
+                        and str(manifest.get("base_sha256") or "").lower()):
+                    pp = os.path.join(tmp_dir, "patch-v%s.bin" % version)
+                    try:
+                        ui(lambda: hint.config(text="正在下载增量补丁…"))
+                        _download_full(patch_url, pp)
+                        if _sha256(pp) == str(pinfo["sha256"]).lower():
+                            ui(lambda: hint.config(text="正在拼装新版本…"))
+                            ok = _apply_patch(local_exe, manifest, pp, dest)
+                    except Exception:
+                        ok = False
+                    finally:
+                        try:
+                            os.remove(pp)
+                        except Exception:
+                            pass
             if not ok:
                 ui(lambda: hint.config(text="正在下载完整更新包…"))
                 _download_full(url, dest)
                 progress(os.path.getsize(dest), os.path.getsize(dest))
-            if manifest and manifest.get("sha256"):
-                ui(lambda: hint.config(text="正在校验更新包…"))
-                if _sha256(dest) != str(manifest["sha256"]).lower():
-                    _download_full(url, dest)
-                    if _sha256(dest) != str(manifest["sha256"]).lower():
-                        raise RuntimeError("更新包校验失败")
+                if want:
+                    ui(lambda: hint.config(text="正在校验更新包…"))
+                    if _sha256(dest) != want:
+                        _download_full(url, dest)
+                        if _sha256(dest) != want:
+                            raise RuntimeError("更新包校验失败")
 
             def finish():
                 try:
@@ -438,7 +508,7 @@ def _check_update(window):
 
     def work():
         try:
-            tag, name, body, url, manifest_url = _latest_release()
+            tag, name, body, url, manifest_url, patch_url = _latest_release()
         except Exception as exc:
             def fail():
                 done()
@@ -466,7 +536,7 @@ def _check_update(window):
         def ask():
             done()
             if messagebox.askyesno("发现新版本", text, parent=window):
-                _run_update(window, tag.lstrip("vV"), url, manifest_url, (tag, name, notes))
+                _run_update(window, tag.lstrip("vV"), url, manifest_url, patch_url, (tag, name, notes))
         window.after(0, ask)
 
     threading.Thread(target=work, daemon=True).start()
