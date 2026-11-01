@@ -1,11 +1,17 @@
-# 模型管理 · 任务栏显示修复工作流
+# 模型管理 · 改包工作流
 
-## 现象
+本目录记录在不改动原程序布局的前提下，对已打包的 `模型管理.exe` 做增量改造的完整流程：
 
-双击 `模型管理.exe` 后窗口正常显示，但任务栏没有对应的按钮/图标。
-最小化后按钮才出现。
+- 任务栏显示修复（v1.1.0）
+- 新图标：exe 文件图标、窗口/任务栏图标、标题栏图标（v1.1.1）
+- 卡通壁纸背景 + 加深配色（v1.1.2）
+- Gitee 在线更新：增量下载、校验、覆盖重启（v1.1.2）
 
-## 根因
+所有改动通过 PyInstaller 运行时钩子注入，不反编译、不重建原程序。
+
+## 一、任务栏不显示
+
+### 根因
 
 主窗口是无边框窗口（`root.overrideredirect(True)`）。Tk 在 Windows 上会创建两层 HWND：
 
@@ -15,47 +21,72 @@
 原程序把 `WS_EX_APPWINDOW` 加到了 `TkChild` 上，而顶层窗口仍带着
 `WS_EX_TOOLWINDOW (0x80)`，所以任务栏始终不显示按钮。
 
-另外，仅修改扩展样式还不够：窗口已经显示时，资源管理器不会重新登记按钮，
-需要隐藏后重新显示一次。
+只改扩展样式还不够：窗口已经显示时资源管理器不会重新登记按钮，需要隐藏后重新显示一次。
 
-## 修复方式（只改任务栏，不动界面布局）
+### 修复
 
-`taskbar_fix_hook.py` 作为 PyInstaller 运行时钩子，在应用主脚本之前执行：
+`update_hook.py` 只挂接 `tkinter.Tk.overrideredirect`（仅主窗口，`Toplevel` 弹窗不受影响）：
 
-1. 只挂接 `tkinter.Tk.overrideredirect`，仅作用于主窗口；
-   `Toplevel` 吐司、编辑弹窗不受影响，不会多出任务栏按钮。
-2. 对 `GetParent(winfo_id())` 对应的顶层窗口：
-   清除 `WS_EX_TOOLWINDOW`，设置 `WS_EX_APPWINDOW`。
-3. `withdraw()` → 60ms 后 `deiconify()`，让任务栏重新登记按钮。
+1. 对 `GetParent(winfo_id())` 对应的顶层窗口清除 `WS_EX_TOOLWINDOW`、设置 `WS_EX_APPWINDOW`；
+2. `SetWindowPos(..., SWP_FRAMECHANGED)` 刷新；
+3. `withdraw()` → 60ms 后 `deiconify()`，让任务栏重新登记按钮；
+4. 重显时补上标题栏图标、检测更新按钮和壁纸。
 
-窗口尺寸、位置、自定义标题栏、卡片布局、图标、配置文件均未改动。
+## 二、图标
 
-## 文件说明
+- 素材：`assets/icon_128.png`（窗口/任务栏）、`assets/icon_title.png`（标题栏），
+  多尺寸 `../model_manager.ico`（16/24/32/48/64/128/256）。
+- 运行时：`iconphoto(True, ...)` 设置任务栏与 Alt-Tab 图标；标题栏图标插在标题文字左侧。
+- 文件图标：`apply_exe_icon.py` 用 Win32 资源 API 重写 `RT_ICON` / `RT_GROUP_ICON`。
+  **注意**：`UpdateResource` 会截断 PyInstaller 追加在 exe 末尾的归档，脚本会先保存 overlay，
+  更新资源后再原样接回。
 
-| 文件 | 作用 |
-| --- | --- |
-| `taskbar_fix_hook.py` | 运行时钩子源码 |
-| `repack_taskbar_fix.py` | 把钩子注入现有 PyInstaller onefile exe |
-| `README.md` | 本说明 |
+## 三、卡通主题
 
-## 重新生成修复版
+- 配色：`repack_taskbar_fix.py` 中的 `THEME` 表，把主脚本里的浅色常量替换为加深的天空蓝系；
+  只替换颜色常量，不动任何布局与控件结构。
+- 壁纸：钩子找到主内容区最大的 Canvas，把壁纸作为最底层 image item 插入，
+  并每 150ms 跟随滚动固定在视口顶部；卡片、工具栏背景不变。
 
-在本目录（`windows程序\模型管理`）执行：
+## 四、在线更新
 
-```bash
-python workflow/repack_taskbar_fix.py "模型管理 - 副本.exe" "模型管理.exe"
-```
+- 更新源：Gitee Releases 最新版
+  `https://gitee.com/api/v5/repos/wenming760/model-manager/releases/latest`
+- 发布物需要两个附件：`model-manager-v<版本>.exe` 与 `model-manager-v<版本>.json`（增量清单）。
+- 清单：`make_update_manifest.py` 生成 `{version, size, chunk, sha256, chunks[]}`，
+  每 512KB 一个 SHA-1。
+- 客户端流程：
+  1. 请求 latest，比较 `tag_name` 与内置版本；
+  2. 本地 exe 大小与清单一致时，逐块比对 SHA-1，只对变化的块发 `Range` 请求；
+  3. 拼装后校验整包 SHA-256，失败则回退全量下载并再次校验；
+  4. 生成临时 `.bat`：等待进程退出 → 重试覆盖 exe → 启动新版 → 清理自身；
+  5. 只覆盖 exe，`api_keys.json` 保留。
+- 下载使用系统自带的 `curl.exe`（HTTPS / Range / 重定向），无 curl 时回退 PowerShell。
+
+## 五、构建命令
 
 要求本机 Python 3.12（与原程序打包版本一致）。
-脚本只新增一个 `pyi_rth_taskbar_fix` 归档项，其它资源原样保留。
 
-## 验证结果
+```bash
+# 1. 注入钩子 + 改版本号 + 加深配色（基于原始 exe）
+python workflow/repack_taskbar_fix.py "模型管理 - 副本.exe" "模型管理.exe" --version 1.1.2
 
-- 启动后任务栏出现「API模型管理 v1.1.0」按钮；
-- 顶层窗口样式：`WS_EX_APPWINDOW=True`、`WS_EX_TOOLWINDOW=False`；
-- 主界面布局与修复前一致；
-- 最小化 / 恢复后按钮仍在。
+# 2. 替换 exe 图标（保留 PyInstaller 归档）
+python workflow/apply_exe_icon.py "模型管理.exe" "model_manager.ico"
 
-## 回滚
+# 3. 生成增量更新清单（发布用）
+python workflow/make_update_manifest.py "model-manager-v1.1.2.exe" "1.1.2" "model-manager-v1.1.2.json"
+```
+
+`--no-theme` 可跳过配色替换；`--version` 会同时同步主脚本版本号与钩子里的版本常量。
+
+## 六、验证
+
+- 启动后任务栏出现机器人图标与「API模型管理 v1.1.2」按钮；
+- 标题栏左侧有机器人图标，右侧有「⟳ 检测更新」，点击应弹出「当前已是最新版本」或新版说明；
+- 主界面布局、卡片排列、搜索/分类/编辑弹窗保持原样；
+- 最小化 / 恢复后任务栏按钮仍在。
+
+## 七、回滚
 
 用目录中的 `模型管理 - 副本.exe` 覆盖 `模型管理.exe` 即可。
