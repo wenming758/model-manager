@@ -29,6 +29,7 @@ _UA = "ModelManager-Update/" + _APP_VERSION
 _NO_WINDOW = 0x08000000
 _MEI_MAGIC = b"MEI\014\013\012\013\016"
 _PATCH_MAGIC = b"MMP1"
+_BG_SIG = hashlib.sha1(_BG_PNG_B64.encode("ascii", "ignore")).hexdigest()[:12]
 
 
 def _photo(window, data_b64, cache_name):
@@ -137,6 +138,9 @@ def _gdiplus():
                                          ctypes.POINTER(_GdipGuid), ctypes.c_void_p]),
                 ("GdipGetImageWidth", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]),
                 ("GdipGetImageHeight", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]),
+                ("GdipCloneBitmapAreaI", [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                          ctypes.POINTER(ctypes.c_void_p)]),
                 ("GdipDisposeImage", [ctypes.c_void_p]),
                 ("GdipDeleteGraphics", [ctypes.c_void_p])):
             fn = getattr(lib, name)
@@ -202,6 +206,39 @@ def _scale_png(src, dst, width, height):
         return False
 
 
+def _crop_png(src, dst, x, y, width, height):
+    g = _gdiplus()
+    if g is None:
+        return False
+    lib, _token, clsid = g
+    try:
+        bmp = ctypes.c_void_p()
+        if lib.GdipCreateBitmapFromFile(src, ctypes.byref(bmp)) != 0:
+            return False
+        try:
+            iw, ih = ctypes.c_int(), ctypes.c_int()
+            lib.GdipGetImageWidth(bmp, ctypes.byref(iw))
+            lib.GdipGetImageHeight(bmp, ctypes.byref(ih))
+            x = max(0, min(int(x), max(iw.value - 1, 0)))
+            y = max(0, min(int(y), max(ih.value - 1, 0)))
+            width = max(1, min(int(width), iw.value - x))
+            height = max(1, min(int(height), ih.value - y))
+            out = ctypes.c_void_p()
+            if lib.GdipCloneBitmapAreaI(x, y, width, height, 0x26200A, bmp,
+                                        ctypes.byref(out)) != 0:
+                return False
+            try:
+                if lib.GdipSaveImageToFile(out, dst, ctypes.byref(clsid), None) != 0:
+                    return False
+            finally:
+                lib.GdipDisposeImage(out)
+        finally:
+            lib.GdipDisposeImage(bmp)
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
+
+
 def _background_photo(window, width, height):
     import tkinter
     key = (int(width), int(height))
@@ -212,11 +249,18 @@ def _background_photo(window, width, height):
         os.makedirs(cache, exist_ok=True)
     except Exception:
         return None
-    src = os.path.join(cache, "background_src.png")
+    src = os.path.join(cache, "background_src_%s.png" % _BG_SIG)
     if not os.path.exists(src):
         with open(src, "wb") as f:
             f.write(base64.b64decode(_BG_PNG_B64))
-    dst = os.path.join(cache, "background_%dx%d.png" % key)
+    dst = os.path.join(cache, "background_%s_%dx%d.png" % (_BG_SIG, key[0], key[1]))
+    for name in os.listdir(cache):
+        if (name.startswith("background_") or name.startswith("canvas_")) \
+                and name.endswith(".png") and _BG_SIG not in name:
+            try:
+                os.remove(os.path.join(cache, name))
+            except Exception:
+                pass
     if not _scale_png(src, dst, key[0], key[1]):
         return None
     try:
@@ -228,11 +272,44 @@ def _background_photo(window, width, height):
     return photo
 
 
+def _canvas_photo(window, x, y, width, height):
+    import tkinter
+    key = (int(x), int(y), int(width), int(height))
+    if getattr(window, "_mm_bg_canvas_key", None) == key:
+        return window._mm_bg_canvas
+    cache = os.path.join(tempfile.gettempdir(), "mm_bg")
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except Exception:
+        return None
+    src = os.path.join(cache, "background_src_%s.png" % _BG_SIG)
+    if not os.path.exists(src):
+        with open(src, "wb") as f:
+            f.write(base64.b64decode(_BG_PNG_B64))
+    dst = os.path.join(cache, "canvas_%s_%d_%d_%dx%d.png" % ((_BG_SIG,) + key))
+    for name in os.listdir(cache):
+        if (name.startswith("background_") or name.startswith("canvas_")) \
+                and name.endswith(".png") and _BG_SIG not in name:
+            try:
+                os.remove(os.path.join(cache, name))
+            except Exception:
+                pass
+    if not _crop_png(src, dst, key[0], key[1], key[2], key[3]):
+        return None
+    try:
+        photo = tkinter.PhotoImage(master=window, file=dst)
+    except Exception:
+        return None
+    window._mm_bg_canvas = photo
+    window._mm_bg_canvas_key = key
+    return photo
+
+
 def _install_background(window):
-    """把卡通壁纸铺在最大画布的最底层，跟随窗口尺寸缩放并固定在视口顶部。"""
+    """整窗壁纸：标题栏、工具栏、内容区、状态栏共用同一张按窗口尺寸缩放的图。"""
     try:
         import tkinter
-        if getattr(window, "_mm_bg_item", None) is not None:
+        if getattr(window, "_mm_shell_on", False):
             return
         best = [None, 0]
 
@@ -253,29 +330,89 @@ def _install_background(window):
                 window._mm_bg_tries = tries + 1
                 window.after(250, lambda: _install_background(window))
             return
-        photo = _background_photo(window, canvas.winfo_width(), canvas.winfo_height())
-        item = canvas.create_image(0, 0, anchor="nw", image=photo or _photo(window, _BG_PNG_B64, "_mm_bg_photo"))
-        canvas.tag_lower(item)
-        window._mm_bg_item = item
-        window._mm_bg_size = (canvas.winfo_width(), canvas.winfo_height())
+        window._mm_shell_on = True
+        state = {"item": None, "photo": None, "size": (0, 0), "labels": [], "root": None}
+
+        def build():
+            w, h = window.winfo_width(), window.winfo_height()
+            if w < 400 or h < 300:
+                return False
+            photo = _background_photo(window, w, h)
+            if photo is None:
+                return False
+            canvas_photo = _canvas_photo(window,
+                                         canvas.winfo_rootx() - window.winfo_rootx(),
+                                         canvas.winfo_rooty() - window.winfo_rooty(),
+                                         canvas.winfo_width(), canvas.winfo_height()) or photo
+            if state["root"] is None:
+                root_label = tkinter.Label(window, image=photo, bd=0, highlightthickness=0)
+                root_label.place(x=0, y=0)
+                state["root"] = root_label
+            else:
+                state["root"].configure(image=photo)
+            if state["item"] is None:
+                item = canvas.create_image(0, 0, anchor="nw", image=canvas_photo)
+                canvas.tag_lower(item)
+                state["item"] = item
+                window._mm_bg_item = item
+            else:
+                canvas.itemconfigure(state["item"], image=canvas_photo)
+            for label in state["labels"]:
+                try:
+                    label.destroy()
+                except Exception:
+                    pass
+            state["labels"] = []
+            for frame in [c for c in window.winfo_children() if c.winfo_class() == "Frame"]:
+                label = tkinter.Label(frame, image=photo, bd=0, highlightthickness=0)
+                label.place(x=0, y=0)
+                label.lower()
+                state["labels"].append(label)
+            state["photo"] = photo
+            state["size"] = (w, h)
+            window._mm_bg_photo = photo
+            window._mm_bg_photo_key = (w, h)
+            window._mm_bg_size = (w, h)
+            return True
+
+        def sync():
+            try:
+                if state["photo"] is None:
+                    return
+                rx, ry = window.winfo_rootx(), window.winfo_rooty()
+                item = state["item"]
+                if item is not None and canvas.winfo_exists():
+                    canvas.coords(item, 0, int(canvas.canvasy(0)))
+                    canvas.tag_lower(item)
+                for label in state["labels"]:
+                    frame = label.master
+                    if not frame.winfo_exists():
+                        continue
+                    label.place(x=-(frame.winfo_rootx() - rx),
+                                y=-(frame.winfo_rooty() - ry))
+                    label.lower()
+                if state["root"] is not None:
+                    state["root"].lower()
+            except Exception:
+                pass
 
         def fit():
             try:
-                if not canvas.winfo_exists():
+                if not window.winfo_exists():
                     return
-                w, h = canvas.winfo_width(), canvas.winfo_height()
-                old = getattr(window, "_mm_bg_size", (0, 0))
+                w, h = window.winfo_width(), window.winfo_height()
+                old = state["size"]
                 if abs(w - old[0]) >= 16 or abs(h - old[1]) >= 16:
-                    scaled = _background_photo(window, w, h)
-                    if scaled is not None:
-                        canvas.itemconfigure(item, image=scaled)
-                        window._mm_bg_size = (w, h)
-                canvas.coords(item, 0, int(canvas.canvasy(0)))
-                canvas.tag_lower(item)
+                    build()
+                sync()
             except Exception:
                 pass
 
         def resized(_event=None):
+            w, h = window.winfo_width(), window.winfo_height()
+            old = state["size"]
+            if abs(w - old[0]) < 16 and abs(h - old[1]) < 16:
+                return
             try:
                 if getattr(window, "_mm_bg_job", None):
                     window.after_cancel(window._mm_bg_job)
@@ -283,18 +420,53 @@ def _install_background(window):
                 pass
             window._mm_bg_job = window.after(220, fit)
 
-        canvas.bind("<Configure>", resized, add="+")
+        if not build():
+            window._mm_shell_on = False
+            window.after(250, lambda: _install_background(window))
+            return
+        sync()
+        window.bind("<Configure>", resized, add="+")
 
         def keep():
             try:
-                if not canvas.winfo_exists():
+                if not window.winfo_exists():
                     return
-                canvas.coords(item, 0, int(canvas.canvasy(0)))
+                sync()
                 window.after(150, keep)
             except Exception:
                 pass
 
         keep()
+    except Exception:
+        pass
+
+
+def _install_version_label(window):
+    """在标题栏程序名后显示当前版本。"""
+    try:
+        if getattr(window, "_mm_version_on", False):
+            return
+        window._mm_version_on = True
+        found = [None]
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if found[0] is not None:
+                    return
+                if child.winfo_class() == "Label":
+                    try:
+                        text = str(child.cget("text")).strip()
+                    except Exception:
+                        text = ""
+                    if text == "API模型管理":
+                        found[0] = child
+                        return
+                walk(child)
+
+        walk(window)
+        label = found[0]
+        if label is not None:
+            label.configure(text="API模型管理  v%s" % _APP_VERSION)
     except Exception:
         pass
 
@@ -896,6 +1068,59 @@ def _install_update_button(window):
 
 # ---------------------------------------------------------------- 任务栏修复
 
+def _round_window(window):
+    """Win10 没有 DWM 圆角，用窗口区域裁出圆角；最大化时保持直角。"""
+    try:
+        if getattr(window, "_mm_round_on", False):
+            return
+        window._mm_round_on = True
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        gdi32.CreateRoundRectRgn.restype = ctypes.c_void_p
+        gdi32.CreateRectRgn.restype = ctypes.c_void_p
+        user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+        state = {"hwnd": user32.GetParent(window.winfo_id()) or window.winfo_id(),
+                 "size": (0, 0)}
+
+        def apply(_event=None):
+            try:
+                if not window.winfo_exists():
+                    return
+                w, h = window.winfo_width(), window.winfo_height()
+                if w < 100 or h < 100:
+                    return
+                hwnd = state["hwnd"]
+                if not user32.IsWindow(hwnd):
+                    state["hwnd"] = hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
+                if state["size"] == (w, h):
+                    return
+                full = w >= user32.GetSystemMetrics(0) - 2 and h >= user32.GetSystemMetrics(1) - 80
+                if full:
+                    region = gdi32.CreateRectRgn(0, 0, w + 1, h + 1)
+                else:
+                    region = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, 28, 28)
+                if user32.SetWindowRgn(hwnd, region, True):
+                    state["size"] = (w, h)
+            except Exception:
+                pass
+
+        def resized(_event=None):
+            w, h = window.winfo_width(), window.winfo_height()
+            if state["size"] == (w, h):
+                return
+            try:
+                if getattr(window, "_mm_round_job", None):
+                    window.after_cancel(window._mm_round_job)
+            except Exception:
+                pass
+            window._mm_round_job = window.after(120, apply)
+
+        apply()
+        window.bind("<Configure>", resized, add="+")
+    except Exception:
+        pass
+
+
 def _fix_taskbar_style(window):
     try:
         window.update_idletasks()
@@ -914,6 +1139,7 @@ def _fix_taskbar_style(window):
 
         def _reshow():
             _insert_title_icon(window)
+            _install_version_label(window)
             _install_update_button(window)
             _install_background(window)
             _install_card_flow(window)
@@ -921,6 +1147,7 @@ def _fix_taskbar_style(window):
                 window.deiconify()
             except Exception:
                 pass
+            _round_window(window)
             window.after(2500, lambda: _check_update(window, True))
 
         window.after(60, _reshow)
