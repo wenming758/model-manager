@@ -1,0 +1,12 @@
+# 本机真实配置（含密钥，绝不提交）
+api_keys.json
+api_keys*.json
+!api_keys.example.json
+
+# 备份与临时产物
+*副本*
+_shot*.png
+_full.png
+__pycache__/
+*.pyc
+*.tmp

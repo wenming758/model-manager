@@ -1,0 +1,35 @@
+{
+  "services": [
+    {
+      "id": "demo01",
+      "name": "示例服务（国内）",
+      "type": "自定义",
+      "category": "国内模型",
+      "model": "example-model",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "sk-xxxxxxxxxxxxxxxx",
+      "temp": 0.7,
+      "max_tokens": 4096,
+      "notes": "示例说明，仅在仪表盘可见",
+      "created": "2026-11-01"
+    },
+    {
+      "id": "demo02",
+      "name": "示例服务（国际）",
+      "type": "其他",
+      "category": "国际模型",
+      "model": "example-model-pro",
+      "base_url": "https://api.example.com/v1",
+      "api_key": "sk-xxxxxxxxxxxxxxxx",
+      "temp": 0.7,
+      "max_tokens": 4096,
+      "notes": "国际版示例",
+      "created": "2026-11-01"
+    }
+  ],
+  "categories": [
+    "默认",
+    "国内模型",
+    "国际模型"
+  ]
+}
