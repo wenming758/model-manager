@@ -9,6 +9,7 @@
 - 增量更新：归档条目级补丁，只下载变化的条目（v1.1.3）
 - 启动自动检测更新、最大化自适应布局、壁纸跟随缩放、更新覆盖加固（v1.1.4）
 - 整窗壁纸 + 标题栏版本号 + 圆角窗口（v1.1.5）
+- 标题栏贴合壁纸 + 版本号移到右上角 + 无边框窗口拖拽 + 流畅最大化（v1.1.6）
 
 所有改动通过 PyInstaller 运行时钩子注入，不反编译、不重建原程序。
 
@@ -61,6 +62,14 @@
   - 缓存文件名带壁纸内容 SHA-1 前缀，换图后自动失效，不会读到旧图；
   - `resized` 只在窗口尺寸变化 ≥16px 时重建，避免自己的贴图触发的 Configure 把防抖
     定时器反复重置。
+- 异步缩放（v1.1.6）：GDI+ 缩放在工作线程里完成并写出 `background_<sig>_<w>x<h>.png`，
+  线程只写文件、不碰 Tk；220ms 的 `keep()` 轮询 `_mm_bg_ready` 拿到结果后再在主线程重建
+  PhotoImage。缩放期间沿用上一张图，最大化不再白屏。
+- 标题栏贴合（v1.1.6）：`_tint_titlebar` 对标题栏底色 Label、机器人图标 Label、标题 Label、
+  版本 Label、「⟳ 检测更新」和三个控制按钮，各取所在矩形中心附近的 3×2 个像素点求平均色，
+  设为控件 `bg`（Button 同时改 `activebackground`、`highlightbackground`）；
+  `<Enter>` 变亮 14、`<Leave>` 还原。窗口重显、每次壁纸重建、宽度变化时都会重刷，
+  避免在 `withdraw` 期间（子控件 1×1）取不到色而留下浅色块。
 
 ## 三之二、最大化自适应（v1.1.4）
 
@@ -69,17 +78,37 @@
   行宽通过 `canvas.itemconfigure(item, width=...)` 拉满，卡片统一 `weight=1` 平分。
 - 8 张卡片实测：1100 宽 4 列、1600 宽 6 列、1920 宽 7 列，卡片右边缘不越界；
   窗口缩回原尺寸时恢复原始 4 列与自动宽度。
-- 用 500ms 轮询 + `<Configure>` 双保险，兼容拖动缩放和系统最大化。
+- 用 600ms 轮询 + `<Configure>`（280ms 防抖）双保险，兼容拖动缩放和系统最大化。
+- 流畅化（v1.1.6）：原程序把 Canvas `<Configure>` 绑到 `_refresh_cards_safe`，
+  每次尺寸变化都会销毁并重建全部卡片（8 张约 0.8 秒），最大化时肉眼可见卡顿。
+  `_install_card_flow` 在接管布局时 `unbind("<Configure>")` 掉这个回调——启动时
+  `__init__` 已经直接调用过 `_refresh_cards()`，取消绑定不影响首屏；
+  重排时先 `itemconfigure(window item, state="hidden")`，网格改完再显示，减少撕裂。
+  实测最大化耗时从约 1.1 秒降到 0.19 秒。
 
-## 三之三、标题栏版本号与圆角（v1.1.5）
+## 三之三、标题栏（v1.1.5 → v1.1.6）
 
-- 版本号：`_install_version_label` 找到标题栏里文本为「API模型管理」的 Label，
-  改为「API模型管理  v<版本>」，版本取钩子里的 `_APP_VERSION`。
+- 版本号：v1.1.5 是把标题 Label 的文本改成「API模型管理  v<版本>」，结果
+  `_find_title_label`（按文本匹配）找不到标题、`_install_update_button` 直接返回，
+  「⟳ 检测更新」按钮消失。v1.1.6 改为**不动标题文本**：
+  - `_find_title_label` 找到后缓存到 `window._mm_title_label`，后续复用；
+  - `_install_version_label` 另建一个 Label（`text="v<版本>"`）`pack(side=RIGHT)`，
+    与「⟳ 检测更新」同排在右上角，顺序为 `… ⟳ 检测更新 | v1.1.6 | ─ □ ✕`。
+    版本号取钩子里的 `_APP_VERSION`。
 - 圆角：Win10 没有 DWM 圆角属性，`_round_window` 对顶层 HWND 调用
   `SetWindowRgn` + `CreateRoundRectRgn(0, 0, w+1, h+1, 28, 28)`（直径 28 = 半径 14）；
   窗口尺寸达到屏幕大小（最大化）时换成矩形区域，保持直角。
+- 圆角不再拖慢缩放（v1.1.6）：尺寸一变就套旧的圆角区域，新露出的部分会被裁掉不重绘，
+  看起来就是撕裂/残影。现在尺寸变化时先套一个**整矩形**区域（`bRedraw=False`，
+  让新区域能画出来），停稳 300ms 后再套圆角（`bRedraw=True`）。
 - `<Configure>` 会派发给所有子控件（Tk bindtags 含顶层路径），处理器只在窗口尺寸真正
   变化时重新应用区域，避免频繁刷 `SetWindowRgn`。
+- 拖拽（v1.1.6）：`_install_drag` 在**顶层**绑 `<ButtonPress-1>` / `<B1-Motion>` /
+  `<ButtonRelease-1>`。因为无边框窗口没有系统标题栏，原程序也没做拖动，用户只能靠
+  最大化/还原间接挪窗口。现在按住标题栏（或标题栏里除按钮外的文字区域）即可拖动：
+  - 起点在标题栏内，且控件不是 Button / Entry / TCombobox / TEntry / Checkbutton /
+    TSpinbox / Scrollbar（「⟳ 检测更新」与版本 Label 被显式加入白名单，可以拖）；
+  - 仅非最大化状态生效；电机用 `event.x_root` 累加，`geometry("+x+y")` 直接定位。
 
 ## 四、在线更新
 
@@ -90,7 +119,8 @@
 - 补丁原理：PyInstaller onefile 的末尾是 CArchive，由 PE 前缀 + 条目区 + TOC + cookie 组成。
   `make_update_manifest.py --base <上一版 exe>` 对比两版归档条目，只把变化的条目
   （主脚本、运行时钩子等）打进 `.patch`，其余条目客户端直接复用本地 exe，再重建 TOC 与 cookie。
-  2026-11-01 的 v1.1.4 → v1.1.5 只有 2/958 个条目变化，补丁 1.0 MB（全量 11.6 MB，壁纸变大所致）。
+  2026-11-01 的 v1.1.4 → v1.1.5 只有 2/958 个条目变化，补丁 1.0 MB（全量 11.6 MB，壁纸变大所致）；
+  v1.1.5 → v1.1.6 同样是 2/958 个条目（主脚本、钩子），补丁 1.0 MB。
 - 客户端流程：
   1. 请求 latest，比较 `tag_name` 与内置版本；
   2. 本地 exe SHA-256 与清单 `base_sha256` 一致时下载 `.patch`，校验补丁 SHA-256 后拼装；
@@ -114,27 +144,39 @@
 要求本机 Python 3.12（与原程序打包版本一致）。
 
 ```bash
-# 1. 注入钩子 + 改版本号 + 加深配色（基于原始 exe）
-python workflow/repack_taskbar_fix.py "模型管理 - 副本.exe" "模型管理.exe" --version 1.1.5
+# 1. 注入钩子 + 改版本号 + 加深配色（基于原始 exe，首次改造用）
+python workflow/repack_taskbar_fix.py "模型管理 - 副本.exe" "模型管理.exe" --version 1.1.6
+
+# 1'. 基于上一版发布 exe 升级（原始 exe 丢失时用 --replace：
+#     原位替换已有的 pyi_rth_taskbar_fix 条目，跳过配色替换）
+python workflow/repack_taskbar_fix.py "model-manager-v1.1.5.exe" "模型管理.exe" --version 1.1.6 --replace
 
 # 2. 替换 exe 图标（保留 PyInstaller 归档）
 python workflow/apply_exe_icon.py "模型管理.exe" "model_manager.ico"
 
 # 3. 生成更新清单 + 相对上一版的增量补丁（发布用）
-python workflow/make_update_manifest.py "model-manager-v1.1.5.exe" "1.1.5"     "model-manager-v1.1.5.json" "model-manager-v1.1.5.patch" --base "model-manager-v1.1.4.exe"
+python workflow/make_update_manifest.py "model-manager-v1.1.6.exe" "1.1.6" \
+    "model-manager-v1.1.6.json" "model-manager-v1.1.6.patch" --base "model-manager-v1.1.5.exe"
 ```
 
 `--no-theme` 可跳过配色替换；`--version` 会同时同步主脚本版本号与钩子里的版本常量。
+`--replace` 用于在已注入钩子的 exe 上做原位升级：不重复插入条目、不重跑配色替换，
+只替换钩子字节与版本号。
 
 ## 六、验证
 
-- 启动后任务栏出现机器人图标与「API模型管理 v1.1.5」按钮，标题栏显示「API模型管理 v1.1.5」；
-- 标题栏左侧有机器人图标，右侧有「⟳ 检测更新」，点击应弹出「当前已是最新版本」或新版说明；
+- 启动后任务栏出现机器人图标与「API模型管理 v1.1.6」按钮，标题栏显示「API模型管理」，
+  右上角依次为「⟳ 检测更新」、「v1.1.6」、最小化/最大化/关闭；
+- 标题栏左侧有机器人图标；点「⟳ 检测更新」应弹出「当前已是最新版本」或新版说明；
+- 标题栏底色、图标底色、版本号底色、三个控制按钮底色与背后壁纸同色系，悬停略亮、
+  移开还原，看不到浅色方块；
+- 非最大化时按住标题栏可拖动窗口，拖动时最大化/关闭按钮不触发；最大化状态下拖动无效；
 - 增量链路：用上一版 exe + `.patch` 在本地拼装，结果应与新 exe 的 SHA-256 完全一致；
 - 补丁损坏 / base 不匹配时应静默回退全量下载，不会写入未校验的文件。
 - 启动 3 秒后无更新时不弹窗；存在新版时弹出说明并可一键更新；
 - 最大化后卡片自动增加列数并铺满，壁纸铺满整个窗口且与工具栏/状态栏连续；恢复原尺寸回到 4 列；
-- 普通尺寸四角为圆角，最大化后为直角；截图 `_tmp/v115_corner.png`、`_tmp/v115_max.png` 可核对；
+- 普通尺寸四角为圆角，最大化后为直角；最大化/还原过程不卡顿（实测 0.19 秒）、不长时间白屏；
+  截图 `_tmp/v116_final_start.png`、`_tmp/v116_final_max.png` 可核对；
 - 主界面布局、卡片结构、搜索/分类/编辑弹窗保持原样；
 - 最小化 / 恢复后任务栏按钮仍在。
 

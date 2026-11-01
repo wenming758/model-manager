@@ -30,6 +30,8 @@ _NO_WINDOW = 0x08000000
 _MEI_MAGIC = b"MEI\014\013\012\013\016"
 _PATCH_MAGIC = b"MMP1"
 _BG_SIG = hashlib.sha1(_BG_PNG_B64.encode("ascii", "ignore")).hexdigest()[:12]
+_BG_PURGED = [False]
+_gdip_lock = threading.Lock()
 
 
 def _photo(window, data_b64, cache_name):
@@ -51,6 +53,13 @@ def _set_window_icon(window):
 
 def _find_title_label(window):
     import tkinter
+    cached = getattr(window, "_mm_title_label", None)
+    if cached is not None:
+        try:
+            if cached.winfo_exists():
+                return cached
+        except Exception:
+            pass
     title = ""
     try:
         title = window.title()
@@ -71,6 +80,8 @@ def _find_title_label(window):
             walk(child)
 
     walk(window)
+    if best[0] is not None:
+        window._mm_title_label = best[0]
     return best[0]
 
 
@@ -160,6 +171,11 @@ def _gdiplus():
 
 
 def _scale_png(src, dst, width, height):
+    with _gdip_lock:
+        return _scale_png_impl(src, dst, width, height)
+
+
+def _scale_png_impl(src, dst, width, height):
     """等比铺满（cover）并居中裁切。"""
     g = _gdiplus()
     if g is None:
@@ -207,6 +223,11 @@ def _scale_png(src, dst, width, height):
 
 
 def _crop_png(src, dst, x, y, width, height):
+    with _gdip_lock:
+        return _crop_png_impl(src, dst, x, y, width, height)
+
+
+def _crop_png_impl(src, dst, x, y, width, height):
     g = _gdiplus()
     if g is None:
         return False
@@ -239,70 +260,223 @@ def _crop_png(src, dst, x, y, width, height):
         return False
 
 
-def _background_photo(window, width, height):
-    import tkinter
-    key = (int(width), int(height))
-    if getattr(window, "_mm_bg_photo_key", None) == key:
-        return window._mm_bg_photo
+def _bg_cache_dir():
     cache = os.path.join(tempfile.gettempdir(), "mm_bg")
     try:
         os.makedirs(cache, exist_ok=True)
     except Exception:
         return None
+    return cache
+
+
+def _bg_src_file():
+    cache = _bg_cache_dir()
+    if cache is None:
+        return None, None
     src = os.path.join(cache, "background_src_%s.png" % _BG_SIG)
     if not os.path.exists(src):
-        with open(src, "wb") as f:
-            f.write(base64.b64decode(_BG_PNG_B64))
-    dst = os.path.join(cache, "background_%s_%dx%d.png" % (_BG_SIG, key[0], key[1]))
-    for name in os.listdir(cache):
-        if (name.startswith("background_") or name.startswith("canvas_")) \
-                and name.endswith(".png") and _BG_SIG not in name:
-            try:
-                os.remove(os.path.join(cache, name))
-            except Exception:
-                pass
-    if not _scale_png(src, dst, key[0], key[1]):
+        try:
+            with open(src, "wb") as f:
+                f.write(base64.b64decode(_BG_PNG_B64))
+        except Exception:
+            return None, None
+    if not _BG_PURGED[0]:
+        _BG_PURGED[0] = True
+        for name in os.listdir(cache):
+            if (name.startswith("background_") or name.startswith("canvas_")) \
+                    and name.endswith(".png") and _BG_SIG not in name:
+                try:
+                    os.remove(os.path.join(cache, name))
+                except Exception:
+                    pass
+    return cache, src
+
+
+def _scaled_file(width, height):
+    cache, src = _bg_src_file()
+    if src is None:
+        return None, None
+    return src, os.path.join(cache, "background_%s_%dx%d.png" % (_BG_SIG, width, height))
+
+
+def _background_photo(window, width, height):
+    import tkinter
+    key = (int(width), int(height))
+    photos = getattr(window, "_mm_bg_photos", None)
+    if photos is None:
+        photos = window._mm_bg_photos = {}
+    if key in photos:
+        window._mm_bg_photo = photos[key]
+        window._mm_bg_photo_key = key
+        return photos[key]
+    src, dst = _scaled_file(key[0], key[1])
+    if src is None:
         return None
+    if not os.path.exists(dst):
+        if getattr(window, "_mm_bg_async_ok", False):
+            # 缩放放到后台线程，拖动/最大化动画期间主线程不被阻塞
+            if getattr(window, "_mm_bg_pending", None) != key:
+                window._mm_bg_pending = key
+
+                def work():
+                    ok = _scale_png(src, dst, key[0], key[1])
+                    window._mm_bg_ready = (key, ok)
+
+                threading.Thread(target=work, daemon=True).start()
+            return None
+        if not _scale_png(src, dst, key[0], key[1]):
+            return None
     try:
         photo = tkinter.PhotoImage(master=window, file=dst)
     except Exception:
         return None
+    while len(photos) >= 4:
+        photos.pop(next(iter(photos)), None)
+    photos[key] = photo
     window._mm_bg_photo = photo
     window._mm_bg_photo_key = key
     return photo
 
 
-def _canvas_photo(window, x, y, width, height):
+def _canvas_photo(window, x, y, width, height, win_width, win_height):
+    """从已缩放的整窗壁纸里裁出画布区域，保证与标题栏/状态栏完全对齐。"""
     import tkinter
     key = (int(x), int(y), int(width), int(height))
-    if getattr(window, "_mm_bg_canvas_key", None) == key:
+    full = ((int(win_width), int(win_height)), key)
+    if getattr(window, "_mm_bg_canvas_key", None) == full:
         return window._mm_bg_canvas
-    cache = os.path.join(tempfile.gettempdir(), "mm_bg")
-    try:
-        os.makedirs(cache, exist_ok=True)
-    except Exception:
+    cache = _bg_cache_dir()
+    if cache is None:
         return None
-    src = os.path.join(cache, "background_src_%s.png" % _BG_SIG)
+    src = os.path.join(cache, "background_%s_%dx%d.png"
+                       % (_BG_SIG, int(win_width), int(win_height)))
     if not os.path.exists(src):
-        with open(src, "wb") as f:
-            f.write(base64.b64decode(_BG_PNG_B64))
-    dst = os.path.join(cache, "canvas_%s_%d_%d_%dx%d.png" % ((_BG_SIG,) + key))
-    for name in os.listdir(cache):
-        if (name.startswith("background_") or name.startswith("canvas_")) \
-                and name.endswith(".png") and _BG_SIG not in name:
-            try:
-                os.remove(os.path.join(cache, name))
-            except Exception:
-                pass
-    if not _crop_png(src, dst, key[0], key[1], key[2], key[3]):
+        return None
+    dst = os.path.join(cache, "canvas_%s_%d_%d_%dx%d_%dx%d.png"
+                       % ((_BG_SIG,) + key + (int(win_width), int(win_height))))
+    if not os.path.exists(dst) and not _crop_png(src, dst, key[0], key[1], key[2], key[3]):
         return None
     try:
         photo = tkinter.PhotoImage(master=window, file=dst)
     except Exception:
         return None
     window._mm_bg_canvas = photo
-    window._mm_bg_canvas_key = key
+    window._mm_bg_canvas_key = full
     return photo
+
+
+def _sample_color(photo, x, y, width, height):
+    """取控件范围若干点的平均色，让控件背景与壁纸贴合。"""
+    total = [0, 0, 0]
+    count = 0
+    for fx in (0.25, 0.5, 0.75):
+        px = int(x + width * fx)
+        for fy in (0.3, 0.7):
+            try:
+                value = photo.get(px, int(y + height * fy))
+            except Exception:
+                continue
+            parts = value if isinstance(value, (tuple, list)) else str(value).split()
+            try:
+                total[0] += int(parts[0])
+                total[1] += int(parts[1])
+                total[2] += int(parts[2])
+            except Exception:
+                continue
+            count += 1
+    if not count:
+        return None
+    return "#%02x%02x%02x" % (total[0] // count, total[1] // count, total[2] // count)
+
+
+def _paint_widget(widget, color):
+    cls = widget.winfo_class()
+    try:
+        widget.configure(bg=color)
+    except Exception:
+        pass
+    if cls == "Button":
+        try:
+            widget.configure(activebackground=color)
+        except Exception:
+            pass
+        try:
+            if int(widget.cget("highlightthickness") or 0) > 0:
+                widget.configure(highlightbackground=color, highlightcolor=color)
+        except Exception:
+            pass
+    if not getattr(widget, "_mm_tint_bound", False):
+        widget._mm_tint_bound = True
+
+        def shade(color, delta):
+            try:
+                r = min(255, int(color[1:3], 16) + delta)
+                g = min(255, int(color[3:5], 16) + delta)
+                b = min(255, int(color[5:7], 16) + delta)
+                return "#%02x%02x%02x" % (r, g, b)
+            except Exception:
+                return None
+
+        def hover(_event=None, w=widget):
+            color_ = getattr(w, "_mm_tint", None)
+            hover_color = shade(color_, 14) if color_ else None
+            if hover_color:
+                try:
+                    w.after(1, lambda: _paint_widget(w, hover_color))
+                except Exception:
+                    pass
+
+        def restore(_event=None, w=widget):
+            color_ = getattr(w, "_mm_tint", None)
+            if not color_:
+                return
+            try:
+                w.after(40, lambda: _paint_widget(w, color_))
+            except Exception:
+                pass
+
+        for seq, handler in (("<Enter>", hover), ("<Leave>", restore)):
+            try:
+                widget.bind(seq, handler, add="+")
+            except Exception:
+                pass
+
+
+def _tint_titlebar(window, photo):
+    """标题栏各控件（图标、标题、版本号、检测更新、─ □ ✕）背景跟随壁纸。"""
+    try:
+        title = _find_title_label(window)
+        if title is None:
+            return
+        bar = title.master
+        rx, ry = window.winfo_rootx(), window.winfo_rooty()
+        targets = [bar]
+
+        def collect(widget):
+            for child in widget.winfo_children():
+                if getattr(child, "_mm_band", False):
+                    continue
+                if child.winfo_class() in ("Label", "Button", "Frame"):
+                    targets.append(child)
+                    if child.winfo_class() == "Frame":
+                        collect(child)
+
+        collect(bar)
+        for widget in targets:
+            try:
+                w, h = widget.winfo_width(), widget.winfo_height()
+                if w < 2 or h < 2:
+                    continue
+                color = _sample_color(photo, widget.winfo_rootx() - rx,
+                                      widget.winfo_rooty() - ry, w, h)
+                if color is None:
+                    continue
+                widget._mm_tint = color
+                _paint_widget(widget, color)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
 def _install_background(window):
@@ -331,7 +505,8 @@ def _install_background(window):
                 window.after(250, lambda: _install_background(window))
             return
         window._mm_shell_on = True
-        state = {"item": None, "photo": None, "size": (0, 0), "labels": [], "root": None}
+        state = {"item": None, "photo": None, "size": (0, 0), "labels": [],
+                 "root": None, "applied": None}
 
         def build():
             w, h = window.winfo_width(), window.winfo_height()
@@ -343,36 +518,63 @@ def _install_background(window):
             canvas_photo = _canvas_photo(window,
                                          canvas.winfo_rootx() - window.winfo_rootx(),
                                          canvas.winfo_rooty() - window.winfo_rooty(),
-                                         canvas.winfo_width(), canvas.winfo_height()) or photo
+                                         canvas.winfo_width(), canvas.winfo_height(),
+                                         w, h)
             if state["root"] is None:
                 root_label = tkinter.Label(window, image=photo, bd=0, highlightthickness=0)
                 root_label.place(x=0, y=0)
+                root_label._mm_band = True
                 state["root"] = root_label
             else:
                 state["root"].configure(image=photo)
             if state["item"] is None:
-                item = canvas.create_image(0, 0, anchor="nw", image=canvas_photo)
+                item = canvas.create_image(0, 0, anchor="nw",
+                                           image=canvas_photo or photo)
                 canvas.tag_lower(item)
                 state["item"] = item
                 window._mm_bg_item = item
-            else:
+            elif canvas_photo is not None:
                 canvas.itemconfigure(state["item"], image=canvas_photo)
+            # 条带背景标签复用，重排时只换图，避免反复销毁/创建造成闪烁
+            frames = [c for c in window.winfo_children() if c.winfo_class() == "Frame"]
+            spare = []
             for label in state["labels"]:
                 try:
-                    label.destroy()
+                    if label.winfo_exists():
+                        spare.append(label)
                 except Exception:
                     pass
-            state["labels"] = []
-            for frame in [c for c in window.winfo_children() if c.winfo_class() == "Frame"]:
-                label = tkinter.Label(frame, image=photo, bd=0, highlightthickness=0)
-                label.place(x=0, y=0)
+            labels = []
+            for frame in frames:
+                label = None
+                for old in spare:
+                    if old.master is frame:
+                        label = old
+                        spare.remove(old)
+                        break
+                if label is None:
+                    label = tkinter.Label(frame, image=photo, bd=0, highlightthickness=0)
+                    label.place(x=0, y=0)
+                    label._mm_band = True
+                else:
+                    label.configure(image=photo)
                 label.lower()
-                state["labels"].append(label)
+                labels.append(label)
+            for old in spare:
+                try:
+                    old.destroy()
+                except Exception:
+                    pass
+            state["labels"] = labels
             state["photo"] = photo
             state["size"] = (w, h)
+            state["applied"] = None
+            # 首次同步缩放完成后，后续尺寸变化走后台线程
+            window._mm_bg_async_ok = True
             window._mm_bg_photo = photo
             window._mm_bg_photo_key = (w, h)
             window._mm_bg_size = (w, h)
+            window.after_idle(lambda: _tint_titlebar(window, photo))
             return True
 
         def sync():
@@ -380,16 +582,24 @@ def _install_background(window):
                 if state["photo"] is None:
                     return
                 rx, ry = window.winfo_rootx(), window.winfo_rooty()
-                item = state["item"]
-                if item is not None and canvas.winfo_exists():
-                    canvas.coords(item, 0, int(canvas.canvasy(0)))
-                    canvas.tag_lower(item)
+                cy = int(canvas.canvasy(0))
+                moves = []
                 for label in state["labels"]:
                     frame = label.master
                     if not frame.winfo_exists():
                         continue
-                    label.place(x=-(frame.winfo_rootx() - rx),
-                                y=-(frame.winfo_rooty() - ry))
+                    moves.append((label, -(frame.winfo_rootx() - rx),
+                                  -(frame.winfo_rooty() - ry)))
+                signature = (cy, tuple((id(l), x, y) for l, x, y in moves))
+                if state["applied"] == signature:
+                    return
+                state["applied"] = signature
+                item = state["item"]
+                if item is not None and canvas.winfo_exists():
+                    canvas.coords(item, 0, cy)
+                    canvas.tag_lower(item)
+                for label, x, y in moves:
+                    label.place(x=x, y=y)
                     label.lower()
                 if state["root"] is not None:
                     state["root"].lower()
@@ -408,7 +618,11 @@ def _install_background(window):
             except Exception:
                 pass
 
-        def resized(_event=None):
+        window._mm_bg_wake = fit
+
+        def resized(event=None):
+            if event is not None and event.widget is not window:
+                return
             w, h = window.winfo_width(), window.winfo_height()
             old = state["size"]
             if abs(w - old[0]) < 16 and abs(h - old[1]) < 16:
@@ -418,7 +632,8 @@ def _install_background(window):
                     window.after_cancel(window._mm_bg_job)
             except Exception:
                 pass
-            window._mm_bg_job = window.after(220, fit)
+            # 窗口动画期间不缩放图片，停稳后再重绘，避免卡顿
+            window._mm_bg_job = window.after(280, fit)
 
         if not build():
             window._mm_shell_on = False
@@ -431,8 +646,19 @@ def _install_background(window):
             try:
                 if not window.winfo_exists():
                     return
+                ready = getattr(window, "_mm_bg_ready", None)
+                if ready:
+                    window._mm_bg_ready = None
+                    key, ok = ready
+                    if ok:
+                        w, h = window.winfo_width(), window.winfo_height()
+                        if abs(w - key[0]) < 16 and abs(h - key[1]) < 16:
+                            build()
                 sync()
-                window.after(150, keep)
+                if state.get("tint_w") != window.winfo_width() and state["photo"] is not None:
+                    state["tint_w"] = window.winfo_width()
+                    _tint_titlebar(window, state["photo"])
+                window.after(220, keep)
             except Exception:
                 pass
 
@@ -442,31 +668,92 @@ def _install_background(window):
 
 
 def _install_version_label(window):
-    """在标题栏程序名后显示当前版本。"""
+    """版本号放在标题栏右上角，与「检测更新」相邻。"""
     try:
-        if getattr(window, "_mm_version_on", False):
+        import tkinter
+        if getattr(window, "_mm_version_btn", None) is not None:
             return
-        window._mm_version_on = True
-        found = [None]
+        title_label = _find_title_label(window)
+        if title_label is None:
+            return
+        bar = title_label.master
+        label = tkinter.Label(bar, text="v%s" % _APP_VERSION, bg=bar.cget("bg"),
+                              fg="#0B5FA8", font=("Microsoft YaHei UI", 9),
+                              bd=0, highlightthickness=0, padx=8)
+        label.pack(side=tkinter.RIGHT, padx=(0, 4))
+        window._mm_version_btn = label
+    except Exception:
+        pass
 
-        def walk(widget):
-            for child in widget.winfo_children():
-                if found[0] is not None:
-                    return
-                if child.winfo_class() == "Label":
-                    try:
-                        text = str(child.cget("text")).strip()
-                    except Exception:
-                        text = ""
-                    if text == "API模型管理":
-                        found[0] = child
-                        return
-                walk(child)
 
-        walk(window)
-        label = found[0]
-        if label is not None:
-            label.configure(text="API模型管理  v%s" % _APP_VERSION)
+def _install_drag(window):
+    """无边框窗口拖动：按住标题栏空白/标题区域移动窗口，最大化时不拖。"""
+    try:
+        import tkinter
+        if getattr(window, "_mm_drag_on", False):
+            return
+        title_label = _find_title_label(window)
+        if title_label is None:
+            return
+        window._mm_drag_on = True
+        bar = title_label.master
+        state = {"armed": False, "px": 0, "py": 0, "wx": 0, "wy": 0}
+
+        def inside_bar(widget):
+            while widget is not None and widget is not window:
+                if widget is bar:
+                    return True
+                try:
+                    widget = widget.master
+                except Exception:
+                    return False
+            return False
+
+        def blocked(widget):
+            whitelist = (getattr(window, "_mm_update_btn", None),
+                         getattr(window, "_mm_version_btn", None))
+            while widget is not None and widget is not window:
+                if widget in whitelist:
+                    return True
+                if widget.winfo_class() in ("Button", "Entry", "TCombobox", "TEntry",
+                                            "Checkbutton", "TSpinbox", "Scrollbar"):
+                    return True
+                try:
+                    widget = widget.master
+                except Exception:
+                    return False
+            return False
+
+        def maximized():
+            try:
+                if window.state() == "zoomed":
+                    return True
+            except Exception:
+                pass
+            return (window.winfo_width() >= window.winfo_screenwidth() - 2
+                    and window.winfo_height() >= window.winfo_screenheight() - 80)
+
+        def press(event):
+            if getattr(event, "num", 1) != 1:
+                return
+            if not inside_bar(event.widget) or blocked(event.widget) or maximized():
+                state["armed"] = False
+                return
+            state.update(armed=True, px=event.x_root, py=event.y_root,
+                         wx=window.winfo_x(), wy=window.winfo_y())
+
+        def motion(event):
+            if not state["armed"]:
+                return
+            window.geometry("+%d+%d" % (state["wx"] + event.x_root - state["px"],
+                                        state["wy"] + event.y_root - state["py"]))
+
+        def release(_event=None):
+            state["armed"] = False
+
+        window.bind("<ButtonPress-1>", press, add="+")
+        window.bind("<B1-Motion>", motion, add="+")
+        window.bind("<ButtonRelease-1>", release, add="+")
     except Exception:
         pass
 
@@ -537,6 +824,15 @@ def _install_card_flow(window):
         def apply():
             if not locate():
                 return
+            if not state.get("wired"):
+                state["wired"] = True
+                try:
+                    # 主程序在画布 <Configure> 里会销毁重建全部卡片（约 0.8s），
+                    # 尺寸变化改由本函数重排列数，避免最大化/拖动时卡顿。
+                    state["canvas"].unbind("<Configure>")
+                    state["canvas"].bind("<Configure>", resized, add="+")
+                except Exception:
+                    pass
             canvas, inner, item, container = (state["canvas"], state["inner"],
                                               state["item"], state["container"])
             width = canvas.winfo_width()
@@ -548,27 +844,47 @@ def _install_card_flow(window):
             # 原始 4 列布局下卡片宽 232、间距 16，重排时按此基准算列数
             cell = state.setdefault("cell", 248)
             cols = min(max(4, (width - 4) // max(cell, 1)), len(cards))
+
+            def relayout(work):
+                # 重排期间先藏起卡片，停稳后一次画出，避免逐帧重绘造成的画面撕裂
+                try:
+                    canvas.itemconfigure(item, state="hidden")
+                except Exception:
+                    pass
+                try:
+                    work()
+                finally:
+                    try:
+                        canvas.itemconfigure(item, state="normal")
+                    except Exception:
+                        pass
+
             if cols <= 4:
                 if state.get("expanded"):
-                    canvas.itemconfigure(item, width=0)
-                    for j in range(16):
-                        container.grid_columnconfigure(j, weight=1 if j < 4 else 0)
-                    for i, k in enumerate(ordered(cards)):
-                        k.grid_configure(row=i // 4, column=i % 4)
-                    inner.update_idletasks()
-                    canvas.configure(scrollregion=(0, 0, max(inner.winfo_reqwidth(), 1),
-                                                   max(inner.winfo_reqheight(), 1)))
+                    def collapse():
+                        canvas.itemconfigure(item, width=0)
+                        for j in range(16):
+                            container.grid_columnconfigure(j, weight=1 if j < 4 else 0)
+                        for i, k in enumerate(ordered(cards)):
+                            k.grid_configure(row=i // 4, column=i % 4)
+                        inner.update_idletasks()
+                        canvas.configure(scrollregion=(0, 0, max(inner.winfo_reqwidth(), 1),
+                                                       max(inner.winfo_reqheight(), 1)))
+                    relayout(collapse)
                     state["expanded"] = False
                 return
             if state.get("expanded") and columns_of(cards) == cols:
                 return
-            canvas.itemconfigure(item, width=width)
-            for j in range(16):
-                container.grid_columnconfigure(j, weight=1 if j < cols else 0)
-            for i, k in enumerate(ordered(cards)):
-                k.grid_configure(row=i // cols, column=i % cols)
-            inner.update_idletasks()
-            canvas.configure(scrollregion=(0, 0, width, max(inner.winfo_reqheight(), 1)))
+
+            def expand():
+                canvas.itemconfigure(item, width=width)
+                for j in range(16):
+                    container.grid_columnconfigure(j, weight=1 if j < cols else 0)
+                for i, k in enumerate(ordered(cards)):
+                    k.grid_configure(row=i // cols, column=i % cols)
+                inner.update_idletasks()
+                canvas.configure(scrollregion=(0, 0, width, max(inner.winfo_reqheight(), 1)))
+            relayout(expand)
             state["expanded"] = True
 
         def tick():
@@ -576,7 +892,7 @@ def _install_card_flow(window):
                 if not window.winfo_exists():
                     return
                 apply()
-                window.after(500, tick)
+                window.after(600, tick)
             except Exception:
                 pass
 
@@ -586,15 +902,10 @@ def _install_card_flow(window):
                     window.after_cancel(window._mm_flow_job)
             except Exception:
                 pass
-            window._mm_flow_job = window.after(160, apply)
+            window._mm_flow_job = window.after(260, apply)
 
+        window.after(300, apply)
         window.after(700, tick)
-        try:
-            locate()
-            if state.get("canvas"):
-                state["canvas"].bind("<Configure>", resized, add="+")
-        except Exception:
-            pass
     except Exception:
         pass
 
@@ -1080,9 +1391,9 @@ def _round_window(window):
         gdi32.CreateRectRgn.restype = ctypes.c_void_p
         user32.SetWindowRgn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
         state = {"hwnd": user32.GetParent(window.winfo_id()) or window.winfo_id(),
-                 "size": (0, 0)}
+                 "size": (0, 0), "round": None}
 
-        def apply(_event=None):
+        def apply(round_corners):
             try:
                 if not window.winfo_exists():
                     return
@@ -1092,30 +1403,43 @@ def _round_window(window):
                 hwnd = state["hwnd"]
                 if not user32.IsWindow(hwnd):
                     state["hwnd"] = hwnd = user32.GetParent(window.winfo_id()) or window.winfo_id()
-                if state["size"] == (w, h):
+                if state["size"] == (w, h) and state["round"] == round_corners:
                     return
-                full = w >= user32.GetSystemMetrics(0) - 2 and h >= user32.GetSystemMetrics(1) - 80
-                if full:
-                    region = gdi32.CreateRectRgn(0, 0, w + 1, h + 1)
-                else:
+                if round_corners:
                     region = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, 28, 28)
-                if user32.SetWindowRgn(hwnd, region, True):
+                else:
+                    region = gdi32.CreateRectRgn(0, 0, w + 1, h + 1)
+                if user32.SetWindowRgn(hwnd, region, bool(round_corners)):
                     state["size"] = (w, h)
+                    state["round"] = round_corners
             except Exception:
                 pass
 
-        def resized(_event=None):
+        def maximized(w, h):
+            return (w >= user32.GetSystemMetrics(0) - 2
+                    and h >= user32.GetSystemMetrics(1) - 80)
+
+        def settle():
+            w, h = window.winfo_width(), window.winfo_height()
+            apply(not maximized(w, h))
+
+        def resized(event=None):
+            if event is not None and event.widget is not window:
+                return
             w, h = window.winfo_width(), window.winfo_height()
             if state["size"] == (w, h):
                 return
+            # 动画期间先用整窗矩形，保证新增区域立刻重绘，停稳后再裁圆角
+            apply(False)
             try:
                 if getattr(window, "_mm_round_job", None):
                     window.after_cancel(window._mm_round_job)
             except Exception:
                 pass
-            window._mm_round_job = window.after(120, apply)
+            window._mm_round_job = window.after(300, settle)
 
-        apply()
+        w, h = window.winfo_width(), window.winfo_height()
+        apply(not maximized(w, h))
         window.bind("<Configure>", resized, add="+")
     except Exception:
         pass
@@ -1148,6 +1472,15 @@ def _fix_taskbar_style(window):
             except Exception:
                 pass
             _round_window(window)
+            _install_drag(window)
+
+            def tint():
+                photo = getattr(window, "_mm_bg_photo", None)
+                if photo is not None:
+                    _tint_titlebar(window, photo)
+
+            window.after(120, tint)
+            window.after(600, tint)
             window.after(2500, lambda: _check_update(window, True))
 
         window.after(60, _reshow)

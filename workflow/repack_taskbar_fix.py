@@ -124,7 +124,7 @@ def build_hook(version):
     return src.replace('__APP_VERSION__', version)
 
 
-def main(src, dst, version=None, theme=True):
+def main(src, dst, version=None, theme=True, replace=False):
     data = open(src, 'rb').read()
     cookie_at = data.rfind(MAGIC)
     if cookie_at < 0:
@@ -134,7 +134,7 @@ def main(src, dst, version=None, theme=True):
     base = len(data) - pkg_len
     entries = parse_toc(data, base, tocpos, toclen)
 
-    if any(e['name'] == HOOK_NAME for e in entries):
+    if any(e['name'] == HOOK_NAME for e in entries) and not replace:
         raise SystemExit('该 exe 已注入过钩子')
 
     entry = main_script(entries)
@@ -153,7 +153,15 @@ def main(src, dst, version=None, theme=True):
     # 放在 pyi_rth__tkinter 之后、主脚本之前，保证 tkinter 可用且先于应用执行
     order = [e['name'] for e in entries]
     pos = order.index('pyi_rth__tkinter') + 1 if 'pyi_rth__tkinter' in order else len(entries)
-    entries.insert(pos, hook)
+    if replace:
+        # 基于上一版发布 exe 升级：原位替换钩子，配色已是加深后的值，不再二次替换
+        for e in entries:
+            if e['name'] == HOOK_NAME:
+                e.update(raw=hook_raw, dlen=len(hook_raw),
+                         ulen=len(hook_pyc), cf=1)
+        print(f'已替换 {HOOK_NAME}')
+    else:
+        entries.insert(pos, hook)
 
     body = bytearray()
     toc = bytearray()
@@ -176,5 +184,8 @@ if __name__ == '__main__':
     parser.add_argument('dst')
     parser.add_argument('--version')
     parser.add_argument('--no-theme', action='store_true')
+    parser.add_argument('--replace', action='store_true',
+                        help='基于上一版发布 exe 升级：原位替换钩子，跳过配色替换')
     args = parser.parse_args()
-    main(args.src, args.dst, args.version, not args.no_theme)
+    main(args.src, args.dst, args.version,
+         not args.no_theme and not args.replace, args.replace)
